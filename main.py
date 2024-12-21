@@ -5,10 +5,12 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import aiohttp
 import asyncio
-from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, time
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Flask-приложение
 app = Flask(__name__)
@@ -83,8 +85,9 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# Глобальные данные
 leaderboard_data = []
-is_game_day = False  # Флаг для определения игрового дня
+scheduler = BackgroundScheduler()
 
 # Функции для получения данных
 async def get_current_gameweek():
@@ -98,19 +101,50 @@ async def get_current_gameweek():
                         if event['is_current']:
                             return event['id']
     except Exception as e:
-        logging.error(f"Error fetching current gameweek: {e}")
+        logger.error(f"Error fetching current gameweek: {e}")
     return None
 
 async def fetch_player_data(player_id, gameweek):
-    # Функция аналогична изначальной
-    ...
+    try:
+        async with aiohttp.ClientSession() as session:
+            history_url = f"https://fantasy.premierleague.com/api/entry/{player_id}/history/"
+            team_url = f"https://fantasy.premierleague.com/api/entry/{player_id}/"
+
+            async with session.get(history_url) as response:
+                if response.status != 200:
+                    return None
+                data = await response.json()
+                current_week_data = next((week for week in data['current'] if week['event'] == gameweek), None)
+                if not current_week_data:
+                    return None
+
+            async with session.get(team_url) as response:
+                if response.status != 200:
+                    return None
+                team_name = (await response.json()).get('name', 'Unknown Team')
+
+            points = current_week_data['points'] - current_week_data['event_transfers_cost']
+            total_points = current_week_data['total_points']
+            transfer_cost = -(current_week_data['event_transfers_cost'])
+            active_chip = current_week_data.get('active_chip', 'None')
+
+            return {
+                'Team': team_name,
+                'Points': points,
+                'Transfer Cost': transfer_cost,
+                'Active Chip': active_chip,
+                'Total Points': total_points,
+            }
+    except Exception as e:
+        logger.error(f"Error fetching data for player {player_id}: {e}")
+        return None
 
 async def update_leaderboard():
     global leaderboard_data
     leaderboard_data = []
     current_gameweek = await get_current_gameweek()
     if not current_gameweek:
-        logging.error("Gameweek not found")
+        logger.error("Gameweek not found")
         return
 
     tasks = [fetch_player_data(player_id, current_gameweek) for player_id in PLAYER_IDS]
@@ -118,46 +152,46 @@ async def update_leaderboard():
 
     leaderboard_data = [player for player in results if player and not isinstance(player, Exception)]
     leaderboard_data.sort(key=lambda x: x['Total Points'], reverse=True)
+    logger.info("Leaderboard updated")
 
-async def check_game_day():
-    global is_game_day
-    tomorrow = datetime.now() + timedelta(days=1)
-    # Логика определения игрового дня
-    is_game_day = await is_next_day_game_day(tomorrow)
-    if is_game_day:
-        logging.info(f"Следующий день ({tomorrow.strftime('%Y-%m-%d')}) — игровой.")
-    else:
-        logging.info(f"Следующий день ({tomorrow.strftime('%Y-%m-%d')}) — не игровой.")
+# Flask маршрут
+@app.route('/', methods=['GET'])
+async def leaderboard():
+    if not leaderboard_data:
+        await update_leaderboard()
+    return render_template_string(HTML_TEMPLATE, leaderboard=enumerate(leaderboard_data, start=1), gameweek=await get_current_gameweek())
 
-async def is_next_day_game_day(date):
-    # Реализация логики определения игрового дня
-    return date.weekday() in [5, 6]  # Суббота или воскресенье
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    application.run_webhook(url_path=f"/{TOKEN}", webhook_url=WEBHOOK_URL)
+    return f"Webhook set to {WEBHOOK_URL}"
 
-async def leaderboard_update_schedule():
-    while True:
-        now = datetime.now()
-        if is_game_day and 10 <= now.hour < 23:
-            logging.info("Обновление данных...")
-            await update_leaderboard()
-            await asyncio.sleep(300)  # Обновление каждые 5 минут
-        else:
-            logging.info("Ожидание игрового времени...")
-            await asyncio.sleep(60)
+# Telegram Handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Привет! Используй /leaderboard, чтобы увидеть таблицу лидеров.")
 
-async def daily_check_schedule():
-    while True:
-        now = datetime.now()
-        if now.hour == 23 and now.minute == 50:
-            await check_game_day()
-        await asyncio.sleep(60)
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global leaderboard_data
+    if not leaderboard_data:
+        await update_leaderboard()
 
-# Основной цикл
-async def main():
-    await asyncio.gather(daily_check_schedule(), leaderboard_update_schedule())
+    message = "🏆 Fantasy League Leaderboard 🏆\n\n"
+    for rank, player in enumerate(leaderboard_data, start=1):
+        message += f"{rank}. {player['Team']} - {player['Total Points']} очков\n"
+    await update.message.reply_text(message)
 
-if __name__ == '__main__':
-    logging.info(f"TELEGRAM_TOKEN: {TOKEN}")
-    logging.info(f"WEBHOOK_URL: {WEBHOOK_URL}")
+# Добавляем обработчики в Telegram
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("leaderboard", leaderboard_command))
 
-    asyncio.run(main())
-    app.run(host='0.0.0.0', port=3000, debug=True)
+# Планировщик
+def schedule_tasks():
+    async def daily_task():
+        current_hour = datetime.now().hour
+        if current_hour == 23:
+            # Пропускаем проверку
+            logger.info("Skipping update; non-game day")
+            return
+        await update_leaderboard()
+
+# Основной блок
