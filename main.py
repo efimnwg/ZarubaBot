@@ -6,7 +6,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 import aiohttp
 import asyncio
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, time
+from datetime import datetime
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -155,8 +155,10 @@ async def update_leaderboard():
     logger.info("Leaderboard updated")
 
 # Flask маршрут
-@app.route('/', methods=['GET'])
+@app.route('/', methods=['GET', 'HEAD'])
 async def leaderboard():
+    if request.method == 'HEAD':
+        return '', 200
     if not leaderboard_data:
         await update_leaderboard()
     return render_template_string(HTML_TEMPLATE, leaderboard=enumerate(leaderboard_data, start=1), gameweek=await get_current_gameweek())
@@ -186,12 +188,24 @@ application.add_handler(CommandHandler("leaderboard", leaderboard_command))
 
 # Планировщик
 def schedule_tasks():
-    async def daily_task():
-        current_hour = datetime.now().hour
-        if current_hour == 23:
-            # Пропускаем проверку
-            logger.info("Skipping update; non-game day")
-            return
-        await update_leaderboard()
+    async def check_and_update():
+        now = datetime.now()
+        if now.hour == 23 and now.minute == 50:
+            logger.info("Checking next game day...")
+        elif 10 <= now.hour <= 23:
+            logger.info("Updating leaderboard...")
+            await update_leaderboard()
+
+    scheduler.add_job(check_and_update, 'interval', minutes=5)
 
 # Основной блок
+if __name__ == '__main__':
+    schedule_tasks()
+    try:
+        scheduler.start()
+        logger.info("Scheduler started.")
+    except Exception as e:
+        logger.error(f"Error starting scheduler: {e}")
+
+    logger.info("Starting Flask app...")
+    app.run(host='0.0.0.0', port=3000, debug=True)
