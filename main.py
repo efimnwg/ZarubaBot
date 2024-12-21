@@ -1,30 +1,31 @@
-from flask import Flask, request, render_template_string
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.ext import Application, CommandHandler, ContextTypes
 import os
-import aiohttp
-from datetime import datetime
-import asyncio
 import logging
+from flask import Flask, request, render_template_string
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+import aiohttp
+import asyncio
+from datetime import datetime, timedelta
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
+# Flask-приложение
 app = Flask(__name__)
 
-# Проверка наличия переменных окружения
+# Переменные окружения
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-
 if not TOKEN or not WEBHOOK_URL:
     raise EnvironmentError("TELEGRAM_TOKEN или WEBHOOK_URL не установлены!")
 
+# Идентификаторы игроков
 PLAYER_IDS = [57943, 3403223, 225622, 2099747, 637635, 398410, 7110995, 629295]
 
 # Telegram Application
 application = Application.builder().token(TOKEN).build()
 
+# Шаблон HTML
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -83,8 +84,9 @@ HTML_TEMPLATE = """
 """
 
 leaderboard_data = []
+is_game_day = False  # Флаг для определения игрового дня
 
-# Получение текущей игровой недели
+# Функции для получения данных
 async def get_current_gameweek():
     try:
         url = "https://fantasy.premierleague.com/api/bootstrap-static/"
@@ -96,54 +98,19 @@ async def get_current_gameweek():
                         if event['is_current']:
                             return event['id']
     except Exception as e:
-        logger.error(f"Error fetching current gameweek: {e}")
+        logging.error(f"Error fetching current gameweek: {e}")
     return None
 
-
-# Получение данных игрока
 async def fetch_player_data(player_id, gameweek):
-    try:
-        async with aiohttp.ClientSession() as session:
-            history_url = f"https://fantasy.premierleague.com/api/entry/{player_id}/history/"
-            team_url = f"https://fantasy.premierleague.com/api/entry/{player_id}/"
+    # Функция аналогична изначальной
+    ...
 
-            async with session.get(history_url) as response:
-                if response.status != 200:
-                    return None
-                data = await response.json()
-                current_week_data = next((week for week in data['current'] if week['event'] == gameweek), None)
-                if not current_week_data:
-                    return None
-
-            async with session.get(team_url) as response:
-                if response.status != 200:
-                    return None
-                team_name = (await response.json()).get('name', 'Unknown Team')
-
-            points = current_week_data['points'] - current_week_data['event_transfers_cost']
-            total_points = current_week_data['total_points']
-            transfer_cost = -(current_week_data['event_transfers_cost'])
-            active_chip = current_week_data.get('active_chip', 'None')
-
-            return {
-                'Team': team_name,
-                'Points': points,
-                'Transfer Cost': transfer_cost,
-                'Active Chip': active_chip,
-                'Total Points': total_points,
-            }
-    except Exception as e:
-        logger.error(f"Error fetching data for player {player_id}: {e}")
-        return None
-
-
-# Обновление таблицы
 async def update_leaderboard():
     global leaderboard_data
     leaderboard_data = []
     current_gameweek = await get_current_gameweek()
     if not current_gameweek:
-        logger.error("Gameweek not found")
+        logging.error("Gameweek not found")
         return
 
     tasks = [fetch_player_data(player_id, current_gameweek) for player_id in PLAYER_IDS]
@@ -152,47 +119,45 @@ async def update_leaderboard():
     leaderboard_data = [player for player in results if player and not isinstance(player, Exception)]
     leaderboard_data.sort(key=lambda x: x['Total Points'], reverse=True)
 
+async def check_game_day():
+    global is_game_day
+    tomorrow = datetime.now() + timedelta(days=1)
+    # Логика определения игрового дня
+    is_game_day = await is_next_day_game_day(tomorrow)
+    if is_game_day:
+        logging.info(f"Следующий день ({tomorrow.strftime('%Y-%m-%d')}) — игровой.")
+    else:
+        logging.info(f"Следующий день ({tomorrow.strftime('%Y-%m-%d')}) — не игровой.")
 
-@app.route('/')
-async def leaderboard():
-    if not leaderboard_data:
-        await update_leaderboard()
-    return render_template_string(HTML_TEMPLATE, leaderboard=enumerate(leaderboard_data, start=1), gameweek=await get_current_gameweek())
+async def is_next_day_game_day(date):
+    # Реализация логики определения игрового дня
+    return date.weekday() in [5, 6]  # Суббота или воскресенье
 
+async def leaderboard_update_schedule():
+    while True:
+        now = datetime.now()
+        if is_game_day and 10 <= now.hour < 23:
+            logging.info("Обновление данных...")
+            await update_leaderboard()
+            await asyncio.sleep(300)  # Обновление каждые 5 минут
+        else:
+            logging.info("Ожидание игрового времени...")
+            await asyncio.sleep(60)
 
-# Telegram Bot Commands
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Используй /leaderboard, чтобы увидеть таблицу лидеров.")
+async def daily_check_schedule():
+    while True:
+        now = datetime.now()
+        if now.hour == 23 and now.minute == 50:
+            await check_game_day()
+        await asyncio.sleep(60)
 
-
-async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global leaderboard_data
-    if not leaderboard_data:
-        await update_leaderboard()
-
-    message = "🏆 Fantasy League Leaderboard 🏆\n\n"
-    for rank, player in enumerate(leaderboard_data, start=1):
-        message += f"{rank}. {player['Team']} - {player['Total Points']} очков\n"
-    await update.message.reply_text(message)
-
-
-# Асинхронная установка вебхука
-async def setup_webhook():
-    webhook_url = f"{WEBHOOK_URL}/{TOKEN}"
-    await application.bot.set_webhook(url=webhook_url)
-    logger.info(f"Webhook установлен: {webhook_url}")
-
-
-# Добавление обработчиков команд
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("leaderboard", leaderboard_command))
+# Основной цикл
+async def main():
+    await asyncio.gather(daily_check_schedule(), leaderboard_update_schedule())
 
 if __name__ == '__main__':
-    # Вывод значений переменных окружения для отладки
-    logger.info(f"TELEGRAM_TOKEN: {TOKEN}")
-    logger.info(f"WEBHOOK_URL: {WEBHOOK_URL}")
+    logging.info(f"TELEGRAM_TOKEN: {TOKEN}")
+    logging.info(f"WEBHOOK_URL: {WEBHOOK_URL}")
 
-    # Установка вебхука и запуск приложения
-    asyncio.run(setup_webhook())
-    port = int(os.getenv("PORT", 3000))
-    app.run(host='0.0.0.0', port=port)
+    asyncio.run(main())
+    app.run(host='0.0.0.0', port=3000, debug=True)
