@@ -5,6 +5,11 @@ import os
 import aiohttp
 from datetime import datetime
 import asyncio
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -79,7 +84,7 @@ HTML_TEMPLATE = """
 
 leaderboard_data = []
 
-
+# Получение текущей игровой недели
 async def get_current_gameweek():
     try:
         url = "https://fantasy.premierleague.com/api/bootstrap-static/"
@@ -91,10 +96,11 @@ async def get_current_gameweek():
                         if event['is_current']:
                             return event['id']
     except Exception as e:
-        print(f"Error fetching current gameweek: {e}")
+        logger.error(f"Error fetching current gameweek: {e}")
     return None
 
 
+# Получение данных игрока
 async def fetch_player_data(player_id, gameweek):
     try:
         async with aiohttp.ClientSession() as session:
@@ -127,16 +133,17 @@ async def fetch_player_data(player_id, gameweek):
                 'Total Points': total_points,
             }
     except Exception as e:
-        print(f"Error fetching data for player {player_id}: {e}")
+        logger.error(f"Error fetching data for player {player_id}: {e}")
         return None
 
 
+# Обновление таблицы
 async def update_leaderboard():
     global leaderboard_data
     leaderboard_data = []
     current_gameweek = await get_current_gameweek()
     if not current_gameweek:
-        print("Gameweek not found")
+        logger.error("Gameweek not found")
         return
 
     tasks = [fetch_player_data(player_id, current_gameweek) for player_id in PLAYER_IDS]
@@ -169,23 +176,23 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(message)
 
 
-# Webhook Setup
-@app.route('/set_webhook', methods=['GET'])
-def set_webhook():
-    application.run_webhook(url_path=f"/{TOKEN}", webhook_url=WEBHOOK_URL)
-    return f"Webhook set to {WEBHOOK_URL}"
+# Асинхронная установка вебхука
+async def setup_webhook():
+    webhook_url = f"{WEBHOOK_URL}/{TOKEN}"
+    await application.bot.set_webhook(url=webhook_url)
+    logger.info(f"Webhook установлен: {webhook_url}")
 
 
-# Add Handlers
+# Добавление обработчиков команд
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("leaderboard", leaderboard_command))
 
 if __name__ == '__main__':
     # Вывод значений переменных окружения для отладки
-    print(f"TELEGRAM_TOKEN: {TOKEN}")
-    print(f"WEBHOOK_URL: {WEBHOOK_URL}")
+    logger.info(f"TELEGRAM_TOKEN: {TOKEN}")
+    logger.info(f"WEBHOOK_URL: {WEBHOOK_URL}")
 
-    # Инициализация обновления таблицы и запуска приложения
-    asyncio.run(update_leaderboard())
-    app.run(host='0.0.0.0', port=3000, debug=True)
-
+    # Установка вебхука и запуск приложения
+    asyncio.run(setup_webhook())
+    port = int(os.getenv("PORT", 3000))
+    app.run(host='0.0.0.0', port=port)
